@@ -2,6 +2,7 @@ use std::{
     env::{args, args_os},
     ffi::CString,
     os::unix::ffi::OsStrExt,
+    path::Path,
 };
 
 mod client;
@@ -14,9 +15,9 @@ fn main() {
                 .skip(3)
                 .map(|arg| CString::new(arg.as_bytes()).unwrap())
                 .collect();
-            server::main(&path, &argv);
+            server::main(Path::new(path), &argv);
         }
-        [Some("attach"), Some(path)] => client::main(path),
+        [Some("attach"), Some(path)] => client::main(Path::new(path)),
         _ => {
             println!(
                 "Usage:

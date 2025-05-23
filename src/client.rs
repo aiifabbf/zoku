@@ -7,7 +7,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use nix::unistd::{read, write};
 
-pub fn main(path: impl AsRef<Path>) {
+pub fn main(path: &Path) {
     let master = UnixStream::connect(path).expect("cannot find server");
 
     let mut stdin = stdin();
@@ -17,6 +17,7 @@ pub fn main(path: impl AsRef<Path>) {
     tty.local_flags.set(LocalFlags::ICANON, false);
     tty.local_flags.set(LocalFlags::ISIG, false);
     dbg!("set -echo -icanon -isig");
+    stdout().flush().unwrap();
     tcsetattr(stdin.as_fd(), SetArg::TCSAFLUSH, &tty).unwrap();
 
     loop {
