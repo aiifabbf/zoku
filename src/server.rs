@@ -1,97 +1,114 @@
-use std::collections::HashSet;
-use std::ffi::CString;
-use std::fs::remove_file;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::net::UnixListener;
-use std::path::Path;
-use std::str::from_utf8;
-use std::sync::{Arc, Mutex};
-use std::thread::spawn;
+use std::{
+    ffi::CString,
+    os::fd::{FromRawFd, IntoRawFd},
+    path::Path,
+};
 
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::pty::{ForkptyResult, forkpty};
-use nix::unistd::{execvp, read, write};
+use nix::{
+    pty::{ForkptyResult, forkpty},
+    unistd::execvp,
+};
+use tokio::{
+    fs::{File, remove_file},
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixListener,
+    runtime::Runtime,
+    select, spawn,
+    sync::mpsc::unbounded_channel,
+};
+
+const BUFFER_SIZE: usize = 4096;
 
 pub fn main(bind: &Path, argv: &[CString]) {
     match unsafe { forkpty(None, None).unwrap() } {
         ForkptyResult::Parent { child: _, master } => {
-            let replay = Arc::new(Mutex::new(vec![]));
-            let clients = Arc::new(Mutex::new(vec![]));
-            let listener = UnixListener::bind(bind).expect("address already in use");
-            {
-                let clients = Arc::clone(&clients);
-                let replay = Arc::clone(&replay);
-                let new_client_worker = spawn(move || {
-                    for client in listener.incoming() {
-                        let client: OwnedFd = client.unwrap().into();
-                        dbg!("waiting for clients write lock");
-                        let mut clients = clients.lock().unwrap();
-                        dbg!("waiting for replay read lock");
-                        let replay = replay.lock().unwrap();
-                        write(client.as_fd(), &replay[..]).unwrap();
-                        clients.push(client);
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async {
+                let (new_client_sender, mut new_client_receiver) = unbounded_channel();
+                let (from_client_sender, mut from_client_receiver) = unbounded_channel::<Vec<u8>>();
+                let listener = UnixListener::bind(bind).expect("address already in use");
+
+                let to_master_sender = from_client_sender.clone();
+                let listener_worker = spawn(async move {
+                    while let Ok((mut client, _addr)) = listener.accept().await {
+                        let (from_master_sender, mut from_master_receiver) =
+                            unbounded_channel::<Vec<u8>>();
+                        // dbg!("sending channels to master");
+                        new_client_sender.send(from_master_sender).unwrap();
+                        let to_master_sender = to_master_sender.clone();
+                        let client_worker = spawn(async move {
+                            loop {
+                                let mut buffer = vec![0; BUFFER_SIZE];
+                                select! {
+                                    Ok(n) = client.read(&mut buffer) => {
+                                        if n == 0 {
+                                            break;
+                                        }
+                                        buffer.truncate(n);
+                                        // dbg!("client worker: sending to master {}", from_utf8(&buffer));
+                                        to_master_sender.send(buffer).unwrap();
+                                    }
+                                    Some(delta) = from_master_receiver.recv() => {
+                                        // dbg!("client worker: writing to client {}", from_utf8(&delta));
+                                        if delta.is_empty() {
+                                            break;
+                                        }
+                                        client.write_all(&delta).await.unwrap();
+                                        client.flush().await.unwrap();
+                                    }
+                                    else => break
+                                };
+                            }
+                        });
                     }
                 });
-            }
 
-            loop {
-                dbg!("waiting for clients read lock");
-                let mut clients = clients.lock().unwrap();
-                dbg!("waiting for replay write lock");
-                let mut replay = replay.lock().unwrap();
+                let mut replay = vec![];
+                let mut clients = vec![];
+                let mut read =
+                    unsafe { File::from_raw_fd(master.try_clone().unwrap().into_raw_fd()) };
+                let mut write = unsafe { File::from_raw_fd(master.into_raw_fd()) };
 
-                let mut fds: Vec<_> = [PollFd::new(master.as_fd(), PollFlags::POLLIN)]
-                    .into_iter()
-                    .chain(
-                        clients
-                            .iter()
-                            .map(|fd| PollFd::new(fd.as_fd(), PollFlags::POLLIN)),
-                    )
-                    .collect();
-
-                let _ = poll(&mut fds, PollTimeout::from(1000u16)).unwrap();
-
-                if fds[0].any().unwrap() {
-                    let mut buffer = [0; 1024];
-                    let n = read(master.as_fd(), &mut buffer).unwrap();
-                    if n > 0 {
-                        dbg!("received from master: ", from_utf8(&buffer[..n]));
-                        replay.extend(&buffer[..n]);
-
-                        for client in clients.iter() {
-                            write(client.as_fd(), &buffer[..n]).unwrap();
+                loop {
+                    let mut buffer = vec![0; BUFFER_SIZE];
+                    select! {
+                        Some(to_new_client_sender) =
+                            new_client_receiver.recv() => {
+                                // dbg!("master worker: new client");
+                                // dbg!("master worker: sending replay to client");
+                                to_new_client_sender.send(replay.clone()).unwrap();
+                                clients.push(to_new_client_sender);
+                                // dbg!("master worker: replay sent");
+                            }
+                        Ok(n) = read.read(&mut buffer) => {
+                            if n == 0 {
+                                break;
+                            }
+                            buffer.truncate(n);
+                            // dbg!("master worker: reading from process {}", from_utf8(&buffer));
+                            // dbg!("master worker: extending replay with delta");
+                            replay.extend(&buffer);
+                            clients.retain(|to_client_sender| {
+                                // dbg!("master worker: sending delta to client");
+                                to_client_sender.send(buffer.clone()).is_ok()
+                            });
                         }
-                    } else {
-                        dbg!("slave is closed");
-                        break;
+                        Some(delta) = from_client_receiver.recv() => {
+                            // dbg!("master worker: writing to process {}", from_utf8(&delta));
+                            write.write_all(&delta).await.unwrap();
+                            write.flush().await.unwrap();
+                            // dbg!("master worker: writing to process done");
+                        }
+                        else => break
                     }
                 }
 
-                let mut inactive_fds = HashSet::new();
-
-                for fd in fds.iter().skip(1) {
-                    if fd.any().unwrap() {
-                        let mut buffer = [0; 1024];
-                        let n = read(fd.as_fd(), &mut buffer).unwrap();
-                        if n > 0 {
-                            dbg!("sending to master: ", from_utf8(&buffer[..n]));
-                            write(master.as_fd(), &buffer[..n]).unwrap();
-                        } else {
-                            dbg!("client is closed");
-                            inactive_fds.insert(fd.as_fd().as_raw_fd());
-                        }
-                    }
-                }
-
-                clients.retain(|fd| !inactive_fds.contains(&fd.as_fd().as_raw_fd()));
-            }
-
-            remove_file(bind).unwrap();
+                remove_file(bind).await.unwrap();
+            })
         }
         ForkptyResult::Child => {
             let sh = CString::new("/bin/sh".as_bytes()).unwrap();
             let path = argv.get(0).unwrap_or(&sh);
-            dbg!("execvp {} {}", argv);
             execvp(&path, &argv).unwrap();
         }
     }
