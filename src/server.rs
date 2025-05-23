@@ -50,9 +50,6 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                     }
                                     Some(delta) = from_master_receiver.recv() => {
                                         // dbg!("client worker: writing to client {}", from_utf8(&delta));
-                                        if delta.is_empty() {
-                                            break;
-                                        }
                                         client.write_all(&delta).await.unwrap();
                                         client.flush().await.unwrap();
                                     }
