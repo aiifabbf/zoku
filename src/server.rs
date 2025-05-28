@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::CString,
     os::fd::{FromRawFd, IntoRawFd},
     path::Path,
@@ -17,7 +18,8 @@ use tokio::{
     sync::mpsc::unbounded_channel,
 };
 
-const BUFFER_SIZE: usize = 4096;
+const BUFFER_SIZE: usize = 1000; // bytes
+const REPLAY_SIZE: usize = 1_000_000; // bytes
 
 pub fn main(bind: &Path, argv: &[CString]) {
     match unsafe { forkpty(None, None).unwrap() } {
@@ -29,24 +31,23 @@ pub fn main(bind: &Path, argv: &[CString]) {
                 let listener = UnixListener::bind(bind).expect("address already in use");
 
                 let to_master_sender = from_client_sender.clone();
-                let listener_worker = spawn(async move {
+                let _listener_worker = spawn(async move {
                     while let Ok((mut client, _addr)) = listener.accept().await {
                         let (from_master_sender, mut from_master_receiver) =
                             unbounded_channel::<Vec<u8>>();
                         // dbg!("sending channels to master");
                         new_client_sender.send(from_master_sender).unwrap();
                         let to_master_sender = to_master_sender.clone();
-                        let client_worker = spawn(async move {
+                        let _client_worker = spawn(async move {
                             loop {
-                                let mut buffer = vec![0; BUFFER_SIZE];
+                                let mut buffer = [0; BUFFER_SIZE];
                                 select! {
                                     Ok(n) = client.read(&mut buffer) => {
                                         if n == 0 {
                                             break;
                                         }
-                                        buffer.truncate(n);
                                         // dbg!("client worker: sending to master {}", from_utf8(&buffer));
-                                        to_master_sender.send(buffer).unwrap();
+                                        to_master_sender.send(buffer[..n].to_owned()).unwrap();
                                     }
                                     Some(delta) = from_master_receiver.recv() => {
                                         // dbg!("client worker: writing to client {}", from_utf8(&delta));
@@ -60,20 +61,28 @@ pub fn main(bind: &Path, argv: &[CString]) {
                     }
                 });
 
-                let mut replay = vec![];
+                let mut replay = VecDeque::new();
                 let mut clients = vec![];
                 let mut read =
                     unsafe { File::from_raw_fd(master.try_clone().unwrap().into_raw_fd()) };
                 let mut write = unsafe { File::from_raw_fd(master.into_raw_fd()) };
 
                 loop {
-                    let mut buffer = vec![0; BUFFER_SIZE];
+                    let mut buffer = [0; BUFFER_SIZE];
                     select! {
+                        biased;
+                        Some(delta) = from_client_receiver.recv() => {
+                            // dbg!("master worker: writing to process {}", from_utf8(&delta));
+                            write.write_all(&delta).await.unwrap();
+                            write.flush().await.unwrap();
+                            // dbg!("master worker: writing to process done");
+                        }
                         Some(to_new_client_sender) =
                             new_client_receiver.recv() => {
                                 // dbg!("master worker: new client");
                                 // dbg!("master worker: sending replay to client");
-                                to_new_client_sender.send(replay.clone()).unwrap();
+                                to_new_client_sender.send(replay.as_slices().0.to_owned()).unwrap();
+                                to_new_client_sender.send(replay.as_slices().1.to_owned()).unwrap();
                                 clients.push(to_new_client_sender);
                                 // dbg!("master worker: replay sent");
                             }
@@ -81,20 +90,22 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             if n == 0 {
                                 break;
                             }
-                            buffer.truncate(n);
                             // dbg!("master worker: reading from process {}", from_utf8(&buffer));
                             // dbg!("master worker: extending replay with delta");
-                            replay.extend(&buffer);
+                            replay.extend(&buffer[..n]);
+                            loop {
+                                if replay.len() < REPLAY_SIZE {
+                                    break;
+                                } else if let Some(index) = replay.iter().position(|c| *c as char == '\n') {
+                                    replay.drain(..index + 1);
+                                } else {
+                                    break;
+                                }
+                            }
                             clients.retain(|to_client_sender| {
                                 // dbg!("master worker: sending delta to client");
-                                to_client_sender.send(buffer.clone()).is_ok()
+                                to_client_sender.send(buffer[..n].to_owned()).is_ok()
                             });
-                        }
-                        Some(delta) = from_client_receiver.recv() => {
-                            // dbg!("master worker: writing to process {}", from_utf8(&delta));
-                            write.write_all(&delta).await.unwrap();
-                            write.flush().await.unwrap();
-                            // dbg!("master worker: writing to process done");
                         }
                         else => break
                     }
