@@ -19,7 +19,8 @@ use tokio::{
 };
 
 const BUFFER_SIZE: usize = 4096; // bytes
-const REPLAY_SIZE: usize = 1_000_000; // bytes
+const CHANNEL_SIZE: usize = 1_000; // messages
+const REPLAY_SIZE: usize = 10_000; // lines
 
 pub fn main(bind: &Path, argv: &[CString]) {
     match unsafe { forkpty(None, None).unwrap() } {
@@ -27,14 +28,14 @@ pub fn main(bind: &Path, argv: &[CString]) {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let (new_client_sender, mut new_client_receiver) = unbounded_channel();
-                let (from_client_sender, mut from_client_receiver) = channel::<Vec<u8>>(BUFFER_SIZE);
+                let (from_client_sender, mut from_client_receiver) = channel::<Vec<u8>>(CHANNEL_SIZE);
                 let listener = UnixListener::bind(bind).expect("address already in use");
 
                 let to_master_sender = from_client_sender.clone();
                 let _listener_worker = spawn(async move {
                     while let Ok((mut client, _addr)) = listener.accept().await {
                         let (from_master_sender, mut from_master_receiver) =
-                            channel::<Vec<u8>>(BUFFER_SIZE);
+                            channel::<Vec<u8>>(CHANNEL_SIZE);
                         // dbg!("sending channels to master");
                         new_client_sender.send(from_master_sender).unwrap();
                         let to_master_sender = to_master_sender.clone();
@@ -61,7 +62,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                     }
                 });
 
-                let mut replay = VecDeque::new();
+                let mut replay = VecDeque::<Vec<u8>>::new();
                 let mut clients = vec![];
                 let mut read =
                     unsafe { File::from_raw_fd(master.try_clone().unwrap().into_raw_fd()) };
@@ -84,8 +85,9 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             new_client_receiver.recv() => {
                                 // dbg!("master worker: new client");
                                 // dbg!("master worker: sending replay to client");
-                                to_new_client_sender.send(replay.as_slices().0.to_owned()).await.unwrap();
-                                to_new_client_sender.send(replay.as_slices().1.to_owned()).await.unwrap();
+                                for line in replay.iter() {
+                                    to_new_client_sender.send(line.clone()).await.unwrap();
+                                }
                                 clients.push(to_new_client_sender);
                                 // dbg!("master worker: replay sent");
                             }
@@ -95,16 +97,22 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             }
                             // dbg!("master worker: reading from process {}", from_utf8(&buffer));
                             // dbg!("master worker: extending replay with delta");
-                            replay.extend(&buffer[..n]);
-                            loop {
-                                if replay.len() < REPLAY_SIZE {
-                                    break;
-                                } else if let Some(index) = replay.iter().position(|c| *c as char == '\n') {
-                                    replay.drain(..index + 1);
+                            for line in buffer[..n].split_inclusive(|c| *c == b'\n') {
+                                if let Some(last) = replay.back_mut() {
+                                    if let Some(b'\n') = last.last() {
+                                        replay.push_back(line.to_owned());
+                                    } else {
+                                        last.extend(line);
+                                    }
                                 } else {
-                                    break;
+                                    replay.push_back(line.to_owned());
                                 }
                             }
+                            let len = replay.len();
+                            if len > REPLAY_SIZE {
+                                replay.drain(..len - REPLAY_SIZE);
+                            }
+                            // dbg!("master worker: keep latest replay", replay.len());
 
                             let mut active_clients = vec![];
 
