@@ -6,7 +6,7 @@ use std::{
 };
 
 use nix::{
-    pty::{ForkptyResult, forkpty},
+    pty::{ForkptyResult, Winsize, forkpty},
     unistd::execvp,
 };
 use tokio::{
@@ -23,12 +23,19 @@ const CHANNEL_SIZE: usize = 1_000; // messages
 const REPLAY_SIZE: usize = 10_000; // lines
 
 pub fn main(bind: &Path, argv: &[CString]) {
-    match unsafe { forkpty(None, None).unwrap() } {
+    let winsize = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    match unsafe { forkpty(&winsize, None).unwrap() } {
         ForkptyResult::Parent { child: _, master } => {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let (new_client_sender, mut new_client_receiver) = unbounded_channel();
-                let (from_client_sender, mut from_client_receiver) = channel::<Vec<u8>>(CHANNEL_SIZE);
+                let (from_client_sender, mut from_client_receiver) =
+                    channel::<Vec<u8>>(CHANNEL_SIZE);
                 let listener = UnixListener::bind(bind).expect("address already in use");
 
                 let to_master_sender = from_client_sender.clone();
@@ -43,12 +50,14 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             loop {
                                 let mut buffer = [0; BUFFER_SIZE];
                                 select! {
+                                    biased;
                                     Ok(n) = client.read(&mut buffer) => {
                                         if n == 0 {
                                             break;
                                         }
+                                        let msg = &buffer[..n];
                                         // dbg!("client worker: sending to master {}", from_utf8(&buffer));
-                                        to_master_sender.send(buffer[..n].to_owned()).await.unwrap();
+                                        to_master_sender.send(msg.to_owned()).await.unwrap();
                                     }
                                     Some(delta) = from_master_receiver.recv() => {
                                         // dbg!("client worker: writing to client {}", from_utf8(&delta));
@@ -95,9 +104,11 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             if n == 0 {
                                 break;
                             }
+                            let msg = &buffer[..n];
                             // dbg!("master worker: reading from process {}", from_utf8(&buffer));
                             // dbg!("master worker: extending replay with delta");
-                            for line in buffer[..n].split_inclusive(|c| *c == b'\n') {
+
+                            for line in msg.split_inclusive(|c| *c == b'\n') {
                                 if let Some(last) = replay.back_mut() {
                                     if let Some(b'\n') = last.last() {
                                         replay.push_back(line.to_owned());
@@ -118,7 +129,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
 
                             for to_client_sender in clients.into_iter() {
                                 // dbg!("master worker: sending delta to client");
-                                if to_client_sender.send(buffer[..n].to_owned()).await.is_ok() {
+                                if to_client_sender.send(msg.to_owned()).await.is_ok() {
                                     active_clients.push(to_client_sender);
                                 }
                             }
