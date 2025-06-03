@@ -14,7 +14,7 @@ use tokio::{
     fs::{File, remove_file},
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
-    runtime::Runtime,
+    runtime::Builder,
     select,
     signal::unix::{SignalKind, signal},
     spawn,
@@ -34,7 +34,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
     };
     match unsafe { forkpty(&winsize, None).unwrap() } {
         ForkptyResult::Parent { child, master } => {
-            let rt = Runtime::new().unwrap();
+            let rt = Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async {
                 let (new_client_sender, mut new_client_receiver) = unbounded_channel();
                 let (from_client_sender, mut from_client_receiver) =

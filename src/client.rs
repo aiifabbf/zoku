@@ -8,7 +8,7 @@ use nix::pty::Winsize;
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::runtime::Runtime;
+use tokio::runtime::Builder;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -24,7 +24,7 @@ pub fn main(path: &Path) {
     std::io::stdout().flush().unwrap();
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSAFLUSH, &tty).unwrap();
 
-    let rt = Runtime::new().unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let mut master = UnixStream::connect(path).await.expect("cannot find server");
         let mut signals = signal(SignalKind::window_change()).unwrap();
