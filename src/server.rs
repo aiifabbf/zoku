@@ -1,11 +1,12 @@
 use std::{
     collections::VecDeque,
     ffi::CString,
-    os::fd::{FromRawFd, IntoRawFd},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd},
     path::Path,
 };
 
 use nix::{
+    libc::{TIOCSWINSZ, ioctl},
     pty::{ForkptyResult, Winsize, forkpty},
     sys::wait::waitpid,
     unistd::execvp,
@@ -25,6 +26,11 @@ const BUFFER_SIZE: usize = 4096; // bytes
 const CHANNEL_SIZE: usize = 1_000; // messages
 const REPLAY_SIZE: usize = 10_000; // lines
 
+enum Message {
+    Raw(Vec<u8>),
+    Resize(u16, u16),
+}
+
 pub fn main(bind: &Path, argv: &[CString]) {
     let winsize = Winsize {
         ws_row: 24,
@@ -38,7 +44,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
             rt.block_on(async {
                 let (new_client_sender, mut new_client_receiver) = unbounded_channel();
                 let (from_client_sender, mut from_client_receiver) =
-                    channel::<Vec<u8>>(CHANNEL_SIZE);
+                    channel::<Message>(CHANNEL_SIZE);
                 let listener = UnixListener::bind(bind).expect("address already in use");
 
                 let to_master_sender = from_client_sender.clone();
@@ -52,15 +58,29 @@ pub fn main(bind: &Path, argv: &[CString]) {
                         let _client_worker = spawn(async move {
                             loop {
                                 let mut buffer = [0; BUFFER_SIZE];
+                                let mut length = [0; 2];
                                 select! {
                                     biased;
-                                    Ok(n) = client.read(&mut buffer) => {
+                                    Ok(n) = client.read_exact(&mut length) => {
                                         if n == 0 {
                                             break;
                                         }
-                                        let msg = &buffer[..n];
-                                        // dbg!("client worker: sending to master {}", from_utf8(&buffer));
-                                        to_master_sender.send(msg.to_owned()).await.unwrap();
+                                        let len = i16::from_be_bytes(length);
+                                        if len > 0 {
+                                            let len = len as usize;
+                                            client.read_exact(&mut buffer[..len]).await.unwrap();
+                                            let msg = &buffer[..len];
+                                            // dbg!("client worker: sending to master {}", from_utf8(&buffer));
+                                            to_master_sender.send(Message::Raw(msg.to_owned())).await.unwrap();
+                                        } else {
+                                            let mut row = [0; 2];
+                                            let mut col = [0; 2];
+                                            client.read_exact(&mut row).await.unwrap();
+                                            client.read_exact(&mut col).await.unwrap();
+                                            let row = u16::from_be_bytes(row);
+                                            let col = u16::from_be_bytes(col);
+                                            to_master_sender.send(Message::Resize(row, col)).await.unwrap();
+                                        }
                                     }
                                     Some(delta) = from_master_receiver.recv() => {
                                         // dbg!("client worker: writing to client {}", from_utf8(&delta));
@@ -82,10 +102,24 @@ pub fn main(bind: &Path, argv: &[CString]) {
                 let mut signals = signal(SignalKind::child()).unwrap();
 
                 let _master_worker = spawn(async move {
-                    while let Some(delta) = from_client_receiver.recv().await {
+                    while let Some(msg) = from_client_receiver.recv().await {
                         // dbg!("master worker: writing to process {}", from_utf8(&delta));
-                        write.write_all(&delta).await.ok()?;
-                        write.flush().await.ok()?;
+                        match msg {
+                            Message::Raw(bytes) => {
+                                write.write_all(&bytes).await.ok()?;
+                                write.flush().await.ok()?;
+                            },
+                            Message::Resize(row, col) => {
+                                let winsize = Winsize {
+                                    ws_row: row,
+                                    ws_col: col,
+                                    ws_xpixel: 0,
+                                    ws_ypixel: 0,
+                                };
+                                // dbg!("master worker: resize to", winsize);
+                                unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
+                            }
+                        }
                     }
                     Some(())
                 });
