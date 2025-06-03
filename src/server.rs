@@ -7,6 +7,7 @@ use std::{
 
 use nix::{
     pty::{ForkptyResult, Winsize, forkpty},
+    sys::wait::waitpid,
     unistd::execvp,
 };
 use tokio::{
@@ -14,7 +15,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
     runtime::Runtime,
-    select, spawn,
+    select,
+    signal::unix::{SignalKind, signal},
+    spawn,
     sync::mpsc::{channel, unbounded_channel},
 };
 
@@ -30,7 +33,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
         ws_ypixel: 0,
     };
     match unsafe { forkpty(&winsize, None).unwrap() } {
-        ForkptyResult::Parent { child: _, master } => {
+        ForkptyResult::Parent { child, master } => {
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
                 let (new_client_sender, mut new_client_receiver) = unbounded_channel();
@@ -76,6 +79,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                 let mut read =
                     unsafe { File::from_raw_fd(master.try_clone().unwrap().into_raw_fd()) };
                 let mut write = unsafe { File::from_raw_fd(master.into_raw_fd()) };
+                let mut signals = signal(SignalKind::child()).unwrap();
 
                 let _master_worker = spawn(async move {
                     while let Some(delta) = from_client_receiver.recv().await {
@@ -134,6 +138,11 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                 }
                             }
                             clients = active_clients;
+                        }
+                        _ = signals.recv() => {
+                            waitpid(child, None).unwrap();
+                            // dbg!("master worker: child process exits");
+                            break;
                         }
                         else => break
                     }
