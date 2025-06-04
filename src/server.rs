@@ -68,28 +68,29 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                         let len = i16::from_be_bytes(length);
                                         if len > 0 {
                                             let len = len as usize;
-                                            client.read_exact(&mut buffer[..len]).await.unwrap();
+                                            client.read_exact(&mut buffer[..len]).await.ok()?;
                                             let msg = &buffer[..len];
                                             // dbg!("client worker: sending to master {}", from_utf8(&buffer));
-                                            to_master_sender.send(Message::Raw(msg.to_owned())).await.unwrap();
+                                            to_master_sender.send(Message::Raw(msg.to_owned())).await.ok()?;
                                         } else {
                                             let mut row = [0; 2];
                                             let mut col = [0; 2];
-                                            client.read_exact(&mut row).await.unwrap();
-                                            client.read_exact(&mut col).await.unwrap();
+                                            client.read_exact(&mut row).await.ok()?;
+                                            client.read_exact(&mut col).await.ok()?;
                                             let row = u16::from_be_bytes(row);
                                             let col = u16::from_be_bytes(col);
-                                            to_master_sender.send(Message::Resize(row, col)).await.unwrap();
+                                            to_master_sender.send(Message::Resize(row, col)).await.ok()?;
                                         }
                                     }
                                     Some(delta) = from_master_receiver.recv() => {
                                         // dbg!("client worker: writing to client {}", from_utf8(&delta));
-                                        client.write_all(&delta).await.unwrap();
-                                        client.flush().await.unwrap();
+                                        client.write_all(&delta).await.ok()?;
+                                        client.flush().await.ok()?;
                                     }
                                     else => break
                                 };
                             }
+                            Some(())
                         });
                     }
                 });
