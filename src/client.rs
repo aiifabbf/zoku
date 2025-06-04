@@ -14,6 +14,17 @@ use tokio::signal::unix::{SignalKind, signal};
 
 const BUFFER_SIZE: usize = 4096; // bytes
 
+async fn notify_resize(mut writer: impl AsyncWriteExt + Unpin) -> Option<()> {
+    let mut ws: Winsize = unsafe { std::mem::zeroed() };
+    unsafe { nix::libc::ioctl(std::io::stdin().as_fd().as_raw_fd(), TIOCGWINSZ, &mut ws) };
+    // let instruction = format!("\x1b[{};{}t", ws.ws_row, ws.ws_col);
+    writer.write_all(&(-4 as i16).to_be_bytes()).await.ok()?;
+    writer.write_all(&ws.ws_row.to_be_bytes()).await.ok()?;
+    writer.write_all(&ws.ws_col.to_be_bytes()).await.ok()?;
+    writer.flush().await.ok()?;
+    Some(())
+}
+
 pub fn main(path: &Path) {
     let old_tty = tcgetattr(std::io::stdin().as_fd()).unwrap();
     let mut tty = old_tty.clone();
@@ -27,6 +38,7 @@ pub fn main(path: &Path) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let mut master = UnixStream::connect(path).await.expect("cannot find server");
+        notify_resize(&mut master).await?;
         let mut signals = signal(SignalKind::window_change()).unwrap();
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
@@ -49,13 +61,7 @@ pub fn main(path: &Path) {
                     }
                 }
                 Some(()) = signals.recv() => {
-                    let mut ws: Winsize = unsafe { std::mem::zeroed() };
-                    unsafe { nix::libc::ioctl(std::io::stdin().as_fd().as_raw_fd(), TIOCGWINSZ, &mut ws) };
-                    // let instruction = format!("\x1b[{};{}t", ws.ws_row, ws.ws_col);
-                    master.write_all(&(-4 as i16).to_be_bytes()).await.ok()?;
-                    master.write_all(&ws.ws_row.to_be_bytes()).await.ok()?;
-                    master.write_all(&ws.ws_col.to_be_bytes()).await.ok()?;
-                    master.flush().await.ok()?;
+                    notify_resize(&mut master).await?;
                 }
                 Ok(n) = master.read(&mut master_buffer) => {
                     let msg = &master_buffer[..n];
