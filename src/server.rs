@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     ffi::CString,
+    iter::once,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd},
     path::Path,
 };
@@ -29,6 +30,117 @@ const REPLAY_SIZE: usize = 10_000; // lines
 enum Message {
     Raw(Vec<u8>),
     Resize(u16, u16),
+}
+
+enum Replay {
+    Normal(VecDeque<Vec<u8>>),
+    Alternate(VecDeque<Vec<u8>>, VecDeque<u8>),
+}
+
+impl Default for Replay {
+    fn default() -> Self {
+        Self::Normal(VecDeque::new())
+    }
+}
+
+const EMPTY: &[u8] = b"";
+static EMPTY_VEC_DEQUE: VecDeque<u8> = VecDeque::new();
+const ENTER_ALTERNATE: &[u8] = b"\x1b[?1049h";
+const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l";
+const CLEAR: &[u8] = b"\x1b[2J";
+
+impl Replay {
+    fn feed(self, bytes: &[u8]) -> Self {
+        match bytes {
+            b"" => self,
+            [head, tail @ ..] => match self {
+                Self::Normal(mut replay) => {
+                    if let Some(last) = replay.back_mut() {
+                        if let Some(b'\n') = last.last() {
+                            replay.push_back(vec![*head]);
+                        } else {
+                            last.extend([head]);
+                        }
+                    } else {
+                        replay.push_back(vec![*head]);
+                    }
+
+                    let len = replay.len();
+                    if len > REPLAY_SIZE {
+                        replay.drain(..len - REPLAY_SIZE);
+                    }
+
+                    if let Some(last) = replay.back_mut() {
+                        if last.ends_with(ENTER_ALTERNATE) {
+                            last.drain(last.len() - ENTER_ALTERNATE.len()..);
+                            Self::Alternate(replay, ENTER_ALTERNATE.iter().cloned().collect())
+                                .feed(tail)
+                        } else if last.ends_with(LEAVE_ALTERNATE) {
+                            last.drain(last.len() - LEAVE_ALTERNATE.len()..);
+                            Self::Normal(replay).feed(tail)
+                        } else {
+                            Self::Normal(replay).feed(tail)
+                        }
+                    } else {
+                        Self::Normal(replay).feed(tail)
+                    }
+                }
+                Self::Alternate(replay, mut latest) => {
+                    latest.extend([head]);
+
+                    // Do not know how to truncate alternate buffer. Would corrupt alternate buffer if done wrongly.
+
+                    // let len = latest.len();
+                    // if len > ENTER_ALTERNATE.len() {
+                    //     latest.drain(..len - ENTER_ALTERNATE.len());
+                    // }
+
+                    if latest
+                        .iter()
+                        .rev()
+                        .take(LEAVE_ALTERNATE.len())
+                        .eq(LEAVE_ALTERNATE.iter().rev())
+                    {
+                        Self::Normal(replay).feed(tail)
+                    } else if latest
+                        .iter()
+                        .rev()
+                        .take(ENTER_ALTERNATE.len())
+                        .eq(ENTER_ALTERNATE.iter().rev())
+                    {
+                        latest.drain(latest.len() - ENTER_ALTERNATE.len()..);
+                        Self::Alternate(replay, latest).feed(tail)
+                    } else {
+                        Self::Alternate(replay, latest).feed(tail)
+                    }
+                }
+            },
+        }
+    }
+
+    fn replay(&self) -> impl Iterator<Item = &[u8]> {
+        match self {
+            Self::Normal(replay) => replay
+                .iter()
+                .map(AsRef::as_ref)
+                .chain(once(EMPTY))
+                .chain(once(EMPTY_VEC_DEQUE.as_slices().0))
+                .chain(once(EMPTY_VEC_DEQUE.as_slices().1)),
+            Self::Alternate(replay, latest) => replay
+                .iter()
+                .map(AsRef::as_ref)
+                .chain(once(ENTER_ALTERNATE))
+                .chain(once(latest.as_slices().0))
+                .chain(once(latest.as_slices().1)),
+        }
+    }
+
+    fn usage(&self) -> (usize, usize) {
+        match self {
+            Self::Normal(replay) => (replay.len(), 0),
+            Self::Alternate(replay, latest) => (replay.len(), latest.len()),
+        }
+    }
 }
 
 pub fn main(bind: &Path, argv: &[CString]) {
@@ -95,7 +207,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                     }
                 });
 
-                let mut replay = VecDeque::<Vec<u8>>::new();
+                let mut replay = Replay::default();
                 let mut clients = vec![];
                 let mut read =
                     unsafe { File::from_raw_fd(master.try_clone().unwrap().into_raw_fd()) };
@@ -104,9 +216,9 @@ pub fn main(bind: &Path, argv: &[CString]) {
 
                 let _master_worker = spawn(async move {
                     while let Some(msg) = from_client_receiver.recv().await {
-                        // dbg!("master worker: writing to process {}", from_utf8(&delta));
                         match msg {
                             Message::Raw(bytes) => {
+                                // dbg!("master worker: writing to process {}", std::str::from_utf8(&bytes));
                                 write.write_all(&bytes).await.ok()?;
                                 write.flush().await.ok()?;
                             },
@@ -117,7 +229,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                     ws_xpixel: 0,
                                     ws_ypixel: 0,
                                 };
-                                // dbg!("master worker: resize to", winsize);
+                                dbg!("master worker: resize to", winsize);
                                 unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
                             }
                         }
@@ -133,8 +245,8 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             new_client_receiver.recv() => {
                                 // dbg!("master worker: new client");
                                 // dbg!("master worker: sending replay to client");
-                                for line in replay.iter() {
-                                    to_new_client_sender.send(line.clone()).await.unwrap();
+                                for line in replay.replay() {
+                                    to_new_client_sender.send(line.to_owned()).await.unwrap();
                                 }
                                 clients.push(to_new_client_sender);
                                 // dbg!("master worker: replay sent");
@@ -144,25 +256,16 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                 break;
                             }
                             let msg = &buffer[..n];
-                            // dbg!("master worker: reading from process {}", from_utf8(&buffer));
-                            // dbg!("master worker: extending replay with delta");
+                            // dbg!("master worker: reading from process {}", std::str::from_utf8(msg));
 
-                            for line in msg.split_inclusive(|c| *c == b'\n') {
-                                if let Some(last) = replay.back_mut() {
-                                    if let Some(b'\n') = last.last() {
-                                        replay.push_back(line.to_owned());
-                                    } else {
-                                        last.extend(line);
-                                    }
-                                } else {
-                                    replay.push_back(line.to_owned());
-                                }
-                            }
-                            let len = replay.len();
-                            if len > REPLAY_SIZE {
-                                replay.drain(..len - REPLAY_SIZE);
-                            }
+                            // dbg!("master worker: extending replay with delta");
+                            replay = replay.feed(msg);
+                            // dbg!("master worker: replay is at", match replay {
+                            //     Replay::Normal(_) => "normal",
+                            //     Replay::Alternate(_, _) => "alternate",
+                            // });
                             // dbg!("master worker: keep latest replay", replay.len());
+                            // dbg!("master worker: replay usage", replay.usage());
 
                             let mut active_clients = vec![];
 
