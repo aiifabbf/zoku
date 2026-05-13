@@ -48,6 +48,14 @@ static EMPTY_VEC_DEQUE: VecDeque<u8> = VecDeque::new();
 const ENTER_ALTERNATE: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l";
 const CLEAR: &[u8] = b"\x1b[2J";
+const QUERY_COMMANDS: &[&[u8]] = &[
+    b"\x1b[6n",  // query cursor position
+    b"\x1b[5n",  // query terminal status
+    b"\x1b[c",   // request device code
+    b"\x1b[0c",  // request device code
+    b"\x1b[18t", // request terminal window size
+    b"\x1b[13t", // request terminal window position
+];
 
 impl Replay {
     fn feed(self, bytes: &[u8]) -> Self {
@@ -79,6 +87,11 @@ impl Replay {
                             last.drain(last.len() - LEAVE_ALTERNATE.len()..);
                             Self::Normal(replay).feed(tail)
                         } else {
+                            for nop in QUERY_COMMANDS {
+                                if last.ends_with(nop) {
+                                    last.drain(last.len() - nop.len()..);
+                                }
+                            }
                             Self::Normal(replay).feed(tail)
                         }
                     } else {
