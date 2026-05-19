@@ -31,13 +31,16 @@ pub fn main(path: &Path) {
     tty.local_flags.set(LocalFlags::ECHO, false);
     tty.local_flags.set(LocalFlags::ICANON, false);
     tty.local_flags.set(LocalFlags::ISIG, false);
-    dbg!("set -echo -icanon -isig");
+    // dbg!("set -echo -icanon -isig");
     std::io::stdout().flush().unwrap();
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSAFLUSH, &tty).unwrap();
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
-        let mut master = UnixStream::connect(path).await.expect("cannot find server");
+        let Some(mut master) = UnixStream::connect(path).await.ok() else {
+            eprintln!("zoku: No session is running on {}", path.display());
+            return None;
+        };
         notify_resize(&mut master).await?;
         let mut signals = signal(SignalKind::window_change()).unwrap();
         let mut stdin = tokio::io::stdin();
@@ -56,7 +59,7 @@ pub fn main(path: &Path) {
                         master.write_all(msg).await.ok()?;
                         master.flush().await.ok()?;
                     } else {
-                        dbg!("master is closed");
+                        // dbg!("master is closed");
                         break;
                     }
                 }
@@ -69,7 +72,7 @@ pub fn main(path: &Path) {
                         stdout.write_all(msg).await.ok()?;
                         stdout.flush().await.ok()?;
                     } else {
-                        dbg!("remote is closed");
+                        // dbg!("remote is closed");
                         break;
                     }
                 }
@@ -78,7 +81,7 @@ pub fn main(path: &Path) {
         Some(())
     });
 
-    dbg!("reset tty");
+    // dbg!("reset tty");
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSAFLUSH, &old_tty).unwrap();
     exit(0);
 }

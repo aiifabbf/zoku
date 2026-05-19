@@ -170,7 +170,10 @@ pub fn main(bind: &Path, argv: &[CString]) {
                 let (new_client_sender, mut new_client_receiver) = unbounded_channel();
                 let (from_client_sender, mut from_client_receiver) =
                     channel::<Message>(CHANNEL_SIZE);
-                let listener = UnixListener::bind(bind).expect("address already in use");
+                let Some(listener) = UnixListener::bind(bind).ok() else {
+                    eprintln!("zoku: Another session is already running on {}", bind.display());
+                    return None;
+                };
 
                 let to_master_sender = from_client_sender.clone();
                 let _listener_worker = spawn(async move {
@@ -178,7 +181,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                         let (from_master_sender, mut from_master_receiver) =
                             channel::<Vec<u8>>(CHANNEL_SIZE);
                         // dbg!("sending channels to master");
-                        new_client_sender.send(from_master_sender).unwrap();
+                        new_client_sender.send(from_master_sender).ok()?;
                         let to_master_sender = to_master_sender.clone();
                         let _client_worker = spawn(async move {
                             loop {
@@ -218,6 +221,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             Some(())
                         });
                     }
+                    Some(())
                 });
 
                 let mut replay = Replay::default();
@@ -242,7 +246,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                     ws_xpixel: 0,
                                     ws_ypixel: 0,
                                 };
-                                dbg!("master worker: resize to", winsize);
+                                // dbg!("master worker: resize to", winsize);
                                 unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
                             }
                         }
@@ -259,7 +263,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                 // dbg!("master worker: new client");
                                 // dbg!("master worker: sending replay to client");
                                 for line in replay.replay() {
-                                    to_new_client_sender.send(line.to_owned()).await.unwrap();
+                                    to_new_client_sender.send(line.to_owned()).await.ok()?;
                                 }
                                 clients.push(to_new_client_sender);
                                 // dbg!("master worker: replay sent");
@@ -291,7 +295,7 @@ pub fn main(bind: &Path, argv: &[CString]) {
                             clients = active_clients;
                         }
                         _ = signals.recv() => {
-                            waitpid(child, None).unwrap();
+                            waitpid(child, None).ok()?;
                             // dbg!("master worker: child process exits");
                             break;
                         }
@@ -299,8 +303,9 @@ pub fn main(bind: &Path, argv: &[CString]) {
                     }
                 }
 
-                remove_file(bind).await.unwrap();
-            })
+                remove_file(bind).await.ok()?;
+                Some(())
+            });
         }
         ForkptyResult::Child => {
             let sh = CString::new("/bin/sh".as_bytes()).unwrap();
