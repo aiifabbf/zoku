@@ -1,8 +1,10 @@
 use std::{
     env::{args, args_os},
     ffi::CString,
-    os::unix::{ffi::OsStrExt, net::UnixStream},
-    path::Path,
+    os::unix::{
+        ffi::OsStrExt,
+        net::{UnixListener, UnixStream},
+    },
 };
 
 use nix::libc::{close, fork, setsid, sleep, umask};
@@ -28,30 +30,45 @@ fn main() {
                 .skip(3)
                 .map(|arg| CString::new(arg.as_bytes()).unwrap())
                 .collect();
-            if let Some(_) = UnixStream::connect(path).ok() {
-                eprintln!("zoku: Another session is already running on {}", path);
-                return;
-            }
-            let pid = unsafe { fork() };
-            if pid != 0 {
-                while let None = UnixStream::connect(path).ok() {
-                    unsafe {
-                        sleep(0);
+            if let Some(listener) = UnixListener::bind(path).ok() {
+                let pid = unsafe { fork() };
+                if pid != 0 {
+                    loop {
+                        if let Some(master) = UnixStream::connect(path).ok() {
+                            client::main(master);
+                            break;
+                        } else {
+                            // what if server exits too soon?
+                            unsafe {
+                                sleep(0);
+                            }
+                        }
                     }
+                } else {
+                    daemon().unwrap();
+                    server::main(listener, &argv);
                 }
-                client::main(Path::new(path));
             } else {
-                daemon().unwrap();
-                server::main(Path::new(path), &argv);
+                eprintln!("zoku: another session is already running on {}", path);
             }
         }
-        [Some("attach"), Some(path)] => client::main(Path::new(path)),
+        [Some("attach"), Some(path)] => {
+            if let Some(master) = UnixStream::connect(path).ok() {
+                client::main(master);
+            } else {
+                eprintln!("zoku: no session is running on {}", path);
+            }
+        }
         [Some("serve"), Some(path)] => {
             let argv: Vec<_> = args_os()
                 .skip(3)
                 .map(|arg| CString::new(arg.as_bytes()).unwrap())
                 .collect();
-            server::main(Path::new(path), &argv);
+            if let Some(listener) = UnixListener::bind(path).ok() {
+                server::main(listener, &argv);
+            } else {
+                eprintln!("zoku: another session is already running on {}", path);
+            }
         }
         _ => {
             println!(

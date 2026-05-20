@@ -3,7 +3,6 @@ use std::{
     ffi::CString,
     iter::once,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd},
-    path::Path,
 };
 
 use nix::{
@@ -15,7 +14,6 @@ use nix::{
 use tokio::{
     fs::{File, remove_file},
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixListener,
     runtime::Builder,
     select,
     signal::unix::{SignalKind, signal},
@@ -156,13 +154,19 @@ impl Replay {
     }
 }
 
-pub fn main(bind: &Path, argv: &[CString]) {
+pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
     let winsize = Winsize {
         ws_row: 24,
         ws_col: 80,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    let bind = listener
+        .local_addr()
+        .unwrap()
+        .as_pathname()
+        .unwrap()
+        .to_path_buf();
     match unsafe { forkpty(&winsize, None).unwrap() } {
         ForkptyResult::Parent { child, master } => {
             let rt = Builder::new_current_thread().enable_all().build().unwrap();
@@ -170,10 +174,8 @@ pub fn main(bind: &Path, argv: &[CString]) {
                 let (new_client_sender, mut new_client_receiver) = unbounded_channel();
                 let (from_client_sender, mut from_client_receiver) =
                     channel::<Message>(CHANNEL_SIZE);
-                let Some(listener) = UnixListener::bind(bind).ok() else {
-                    eprintln!("zoku: Another session is already running on {}", bind.display());
-                    return None;
-                };
+                listener.set_nonblocking(true).unwrap();
+                let listener = tokio::net::UnixListener::from_std(listener).unwrap();
 
                 let to_master_sender = from_client_sender.clone();
                 let _listener_worker = spawn(async move {
@@ -263,7 +265,9 @@ pub fn main(bind: &Path, argv: &[CString]) {
                                 // dbg!("master worker: new client");
                                 // dbg!("master worker: sending replay to client");
                                 for line in replay.replay() {
-                                    to_new_client_sender.send(line.to_owned()).await.ok()?;
+                                    if !to_new_client_sender.send(line.to_owned()).await.is_ok() {
+                                        break;
+                                    }
                                 }
                                 clients.push(to_new_client_sender);
                                 // dbg!("master worker: replay sent");

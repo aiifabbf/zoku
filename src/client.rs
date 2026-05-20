@@ -1,13 +1,11 @@
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd};
-use std::path::Path;
 use std::process::exit;
 
 use nix::libc::TIOCGWINSZ;
 use nix::pty::Winsize;
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::runtime::Builder;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
@@ -25,7 +23,7 @@ async fn notify_resize(mut writer: impl AsyncWriteExt + Unpin) -> Option<()> {
     Some(())
 }
 
-pub fn main(path: &Path) {
+pub fn main(master: std::os::unix::net::UnixStream) {
     let old_tty = tcgetattr(std::io::stdin().as_fd()).unwrap();
     let mut tty = old_tty.clone();
     tty.local_flags.set(LocalFlags::ECHO, false);
@@ -37,10 +35,8 @@ pub fn main(path: &Path) {
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
-        let Some(mut master) = UnixStream::connect(path).await.ok() else {
-            eprintln!("zoku: No session is running on {}", path.display());
-            return None;
-        };
+        master.set_nonblocking(true).unwrap();
+        let mut master = tokio::net::UnixStream::from_std(master).unwrap();
         notify_resize(&mut master).await?;
         let mut signals = signal(SignalKind::window_change()).unwrap();
         let mut stdin = tokio::io::stdin();
