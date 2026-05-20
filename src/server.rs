@@ -42,7 +42,6 @@ impl Default for Replay {
 }
 
 const EMPTY: &[u8] = b"";
-static EMPTY_VEC_DEQUE: VecDeque<u8> = VecDeque::new();
 const ENTER_ALTERNATE: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l";
 const QUERY_COMMANDS: &[&[u8]] = &[
@@ -98,12 +97,12 @@ impl Replay {
                 Self::Alternate(replay, mut latest) => {
                     latest.extend([head]);
 
-                    // Do not know how to truncate alternate buffer. Would corrupt alternate buffer if done wrongly.
-
-                    // let len = latest.len();
-                    // if len > ENTER_ALTERNATE.len() {
-                    //     latest.drain(..len - ENTER_ALTERNATE.len());
-                    // }
+                    // I do not know how to truncate alternate buffer. It would corrupt alternate buffer if done wrongly. So here I just do not replay anything on alternate buffer. Hope all well-written TUI apps would properly redraw whole screen upon window resizing!
+                    let len = latest.len();
+                    if len > ENTER_ALTERNATE.len() {
+                        latest.drain(..len - ENTER_ALTERNATE.len());
+                    }
+                    debug_assert!(latest.len() <= ENTER_ALTERNATE.len());
 
                     if latest
                         .iter()
@@ -118,7 +117,6 @@ impl Replay {
                         .take(ENTER_ALTERNATE.len())
                         .eq(ENTER_ALTERNATE.iter().rev())
                     {
-                        latest.drain(latest.len() - ENTER_ALTERNATE.len()..);
                         Self::Alternate(replay, latest).feed(tail)
                     } else {
                         Self::Alternate(replay, latest).feed(tail)
@@ -130,18 +128,11 @@ impl Replay {
 
     fn replay(&self) -> impl Iterator<Item = &[u8]> {
         match self {
-            Self::Normal(replay) => replay
+            Self::Normal(replay) => replay.iter().map(AsRef::as_ref).chain(once(EMPTY)),
+            Self::Alternate(replay, _latest) => replay
                 .iter()
                 .map(AsRef::as_ref)
-                .chain(once(EMPTY))
-                .chain(once(EMPTY_VEC_DEQUE.as_slices().0))
-                .chain(once(EMPTY_VEC_DEQUE.as_slices().1)),
-            Self::Alternate(replay, latest) => replay
-                .iter()
-                .map(AsRef::as_ref)
-                .chain(once(ENTER_ALTERNATE))
-                .chain(once(latest.as_slices().0))
-                .chain(once(latest.as_slices().1)),
+                .chain(once(ENTER_ALTERNATE)),
         }
     }
 }
@@ -236,12 +227,15 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                             Message::Resize(row, col) => {
                                 let winsize = Winsize {
                                     ws_row: row,
-                                    ws_col: col,
+                                    ws_col: col.saturating_sub(1),
                                     ws_xpixel: 0,
                                     ws_ypixel: 0,
                                 };
-                                // dbg!("master worker: resize to", winsize);
                                 unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
+                                // dbg!("master worker: resize to", winsize);
+                                let winsize = Winsize { ws_col: col, ..winsize };
+                                unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
+                                // Why do it twice? To force redraw. Some TUI app such as vim does not redraw whole screen if new size is the same as old size.
                             }
                         }
                     }
