@@ -45,7 +45,6 @@ const EMPTY: &[u8] = b"";
 static EMPTY_VEC_DEQUE: VecDeque<u8> = VecDeque::new();
 const ENTER_ALTERNATE: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALTERNATE: &[u8] = b"\x1b[?1049l";
-const CLEAR: &[u8] = b"\x1b[2J";
 const QUERY_COMMANDS: &[&[u8]] = &[
     b"\x1b[6n",  // query cursor position
     b"\x1b[5n",  // query terminal status
@@ -143,13 +142,6 @@ impl Replay {
                 .chain(once(ENTER_ALTERNATE))
                 .chain(once(latest.as_slices().0))
                 .chain(once(latest.as_slices().1)),
-        }
-    }
-
-    fn usage(&self) -> (usize, usize) {
-        match self {
-            Self::Normal(replay) => (replay.len(), 0),
-            Self::Alternate(replay, latest) => (replay.len(), latest.len()),
         }
     }
 }
@@ -311,6 +303,7 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                 Some(())
             });
         }
+        #[expect(unreachable_code)]
         ForkptyResult::Child => {
             let sh = CString::new("/bin/sh".as_bytes()).unwrap();
             let path = argv.get(0).unwrap_or(&sh);
