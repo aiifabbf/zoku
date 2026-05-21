@@ -5,6 +5,7 @@ use std::{
         ffi::OsStrExt,
         net::{UnixListener, UnixStream},
     },
+    process::ExitCode,
 };
 
 use nix::libc::{close, fork, setsid, sleep, umask};
@@ -23,7 +24,7 @@ fn daemon() -> Option<()> {
     Some(())
 }
 
-fn main() {
+fn main() -> ExitCode {
     match [args().nth(1).as_deref(), args().nth(2).as_deref()] {
         [Some("new"), Some(path)] => {
             let argv: Vec<_> = args_os()
@@ -44,19 +45,24 @@ fn main() {
                             }
                         }
                     }
+                    ExitCode::SUCCESS
                 } else {
                     daemon().unwrap();
                     server::main(listener, &argv);
+                    ExitCode::SUCCESS
                 }
             } else {
                 eprintln!("zoku: another session is already running on {}", path);
+                ExitCode::FAILURE
             }
         }
         [Some("attach"), Some(path)] => {
             if let Some(master) = UnixStream::connect(path).ok() {
                 client::main(master);
+                ExitCode::SUCCESS
             } else {
                 eprintln!("zoku: no session is running on {}", path);
+                ExitCode::FAILURE
             }
         }
         [Some("serve"), Some(path)] => {
@@ -66,8 +72,10 @@ fn main() {
                 .collect();
             if let Some(listener) = UnixListener::bind(path).ok() {
                 server::main(listener, &argv);
+                ExitCode::SUCCESS
             } else {
                 eprintln!("zoku: another session is already running on {}", path);
+                ExitCode::FAILURE
             }
         }
         _ => {
@@ -77,6 +85,7 @@ fn main() {
     zoku attach path
     zoku serve path program"
             );
+            ExitCode::FAILURE
         }
     }
 }
