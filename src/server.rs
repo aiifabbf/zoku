@@ -51,7 +51,11 @@ const QUERY_COMMANDS: &[&[u8]] = &[
     b"\x1b[0c",  // request device code
     b"\x1b[18t", // request terminal window size
     b"\x1b[13t", // request terminal window position
+    b"\x1b[>q",  // report xterm name and version
+    b"\x1b[>0q", // report xterm name and version
 ];
+// There are so many commands that can cause terminal emulator to respond: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+// Use regex automata for a complete solution?
 
 impl Replay {
     fn feed(self, bytes: &[u8]) -> Self {
