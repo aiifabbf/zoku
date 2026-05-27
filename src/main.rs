@@ -8,7 +8,8 @@ use std::{
     process::ExitCode,
 };
 
-use nix::libc::{close, fork, setsid, sleep, umask};
+use nix::libc::open;
+use nix::libc::{O_RDWR, dup2, fork, setsid, sleep, umask};
 
 mod client;
 mod server;
@@ -17,9 +18,11 @@ fn daemon() -> Option<()> {
     unsafe {
         setsid();
         umask(0);
-        close(0);
-        close(1);
-        close(2);
+        // redirect stdin, stdout, stderr
+        let fd = open(CString::new("/dev/null").unwrap().as_ptr(), O_RDWR);
+        dup2(fd, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
     }
     Some(())
 }
