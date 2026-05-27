@@ -166,46 +166,55 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
 
                 let to_master_sender = from_client_sender.clone();
                 let _listener_worker = spawn(async move {
-                    while let Ok((mut client, _addr)) = listener.accept().await {
+                    while let Ok((client, _addr)) = listener.accept().await {
                         let (from_master_sender, mut from_master_receiver) =
                             channel::<Vec<u8>>(CHANNEL_SIZE);
                         // dbg!("sending channels to master");
                         new_client_sender.send(from_master_sender).ok()?;
                         let to_master_sender = to_master_sender.clone();
-                        let _client_worker = spawn(async move {
+                        let (mut client_read, mut client_write) = client.into_split();
+                        let _client_read_worker = spawn(async move {
                             loop {
                                 let mut buffer = [0; BUFFER_SIZE];
                                 let mut length = [0; 2];
-                                select! {
-                                    biased;
-                                    Ok(n) = client.read_exact(&mut length) => {
-                                        if n == 0 {
-                                            break;
-                                        }
-                                        let len = i16::from_be_bytes(length);
-                                        if len > 0 {
-                                            let len = len as usize;
-                                            client.read_exact(&mut buffer[..len]).await.ok()?;
-                                            let msg = &buffer[..len];
-                                            // dbg!("client worker: sending to master {}", from_utf8(&buffer));
-                                            to_master_sender.send(Message::Raw(msg.to_owned())).await.ok()?;
-                                        } else {
-                                            let mut row = [0; 2];
-                                            let mut col = [0; 2];
-                                            client.read_exact(&mut row).await.ok()?;
-                                            client.read_exact(&mut col).await.ok()?;
-                                            let row = u16::from_be_bytes(row);
-                                            let col = u16::from_be_bytes(col);
-                                            to_master_sender.send(Message::Resize(row, col)).await.ok()?;
-                                        }
+                                if let Ok(2) = client_read.read_exact(&mut length).await {
+                                    let len = i16::from_be_bytes(length);
+                                    if len > 0 {
+                                        let len = len as usize;
+                                        client_read.read_exact(&mut buffer[..len]).await.ok()?;
+                                        let msg = &buffer[..len];
+                                        // dbg!("client worker: sending to master {}", from_utf8(&buffer));
+                                        to_master_sender
+                                            .send(Message::Raw(msg.to_owned()))
+                                            .await
+                                            .ok()?;
+                                    } else {
+                                        let mut row = [0; 2];
+                                        let mut col = [0; 2];
+                                        client_read.read_exact(&mut row).await.ok()?;
+                                        client_read.read_exact(&mut col).await.ok()?;
+                                        let row = u16::from_be_bytes(row);
+                                        let col = u16::from_be_bytes(col);
+                                        to_master_sender
+                                            .send(Message::Resize(row, col))
+                                            .await
+                                            .ok()?;
                                     }
-                                    Some(delta) = from_master_receiver.recv() => {
-                                        // dbg!("client worker: writing to client {}", from_utf8(&delta));
-                                        client.write_all(&delta).await.ok()?;
-                                        client.flush().await.ok()?;
-                                    }
-                                    else => break
-                                };
+                                } else {
+                                    break;
+                                }
+                            }
+                            Some(())
+                        });
+                        let _client_write_worker = spawn(async move {
+                            loop {
+                                if let Some(delta) = from_master_receiver.recv().await {
+                                    // dbg!("client worker: writing to client {}", from_utf8(&delta));
+                                    client_write.write_all(&delta).await.ok()?;
+                                    client_write.flush().await.ok()?;
+                                } else {
+                                    break;
+                                }
                             }
                             Some(())
                         });
@@ -227,7 +236,7 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                                 // dbg!("master worker: writing to process {}", std::str::from_utf8(&bytes));
                                 write.write_all(&bytes).await.ok()?;
                                 write.flush().await.ok()?;
-                            },
+                            }
                             Message::Resize(row, col) => {
                                 let winsize = Winsize {
                                     ws_row: row,
@@ -237,7 +246,10 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                                 };
                                 unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
                                 // dbg!("master worker: resize to", winsize);
-                                let winsize = Winsize { ws_col: col, ..winsize };
+                                let winsize = Winsize {
+                                    ws_col: col,
+                                    ..winsize
+                                };
                                 unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
                                 // Why do it twice? To force redraw. Some TUI app such as vim does not redraw whole screen if new size is the same as old size.
                             }
