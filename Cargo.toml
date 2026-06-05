@@ -11,5 +11,6 @@ keywords = ["terminal-multiplexer"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+async-signal = "0.2.14"
 nix = { version = "0.30.1", features = ["term", "process", "ioctl", "fs", "poll"] }
-tokio = { version = "1.45.0", features = ["full"] }
+smol = "2.0.2"

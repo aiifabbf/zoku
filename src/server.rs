@@ -1,24 +1,21 @@
-use std::{
-    collections::VecDeque,
-    ffi::CString,
-    iter::once,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd},
-};
+use std::{collections::VecDeque, ffi::CString, iter::once, os::fd::AsRawFd};
 
+use async_signal::{Signal, Signals};
 use nix::{
     libc::{TIOCSWINSZ, ioctl},
     pty::{ForkptyResult, Winsize, forkpty},
     sys::wait::waitpid,
     unistd::execvp,
 };
-use tokio::{
+use smol::{
+    block_on,
+    channel::{Receiver, Sender, bounded, unbounded},
     fs::{File, remove_file},
-    io::{AsyncReadExt, AsyncWriteExt},
-    runtime::Builder,
-    select,
-    signal::unix::{SignalKind, signal},
+    future::FutureExt,
+    io::{AsyncReadExt, AsyncWriteExt, split},
+    net::unix::{UnixListener, UnixStream},
     spawn,
-    sync::mpsc::{channel, unbounded_channel},
+    stream::StreamExt,
 };
 
 const BUFFER_SIZE: usize = 4096; // bytes
@@ -141,6 +138,54 @@ impl Replay {
     }
 }
 
+async fn handle_new_client(
+    client: UnixStream,
+    from_master: Receiver<Vec<u8>>,
+    to_master: Sender<Message>,
+) -> Option<()> {
+    let (mut client_read, mut client_write) = split(client);
+    let client_read_worker = async move {
+        loop {
+            let mut buffer = [0; BUFFER_SIZE];
+            let mut length = [0; 2];
+            if let Ok(_) = client_read.read_exact(&mut length).await {
+                let len = i16::from_be_bytes(length);
+                if len > 0 {
+                    let len = len as usize;
+                    client_read.read_exact(&mut buffer[..len]).await.ok()?;
+                    let msg = &buffer[..len];
+                    to_master.send(Message::Raw(msg.to_owned())).await.ok()?;
+                } else {
+                    let mut row = [0; 2];
+                    let mut col = [0; 2];
+                    client_read.read_exact(&mut row).await.ok()?;
+                    client_read.read_exact(&mut col).await.ok()?;
+                    let row = u16::from_be_bytes(row);
+                    let col = u16::from_be_bytes(col);
+                    to_master.send(Message::Resize(row, col)).await.ok()?;
+                }
+            } else {
+                break;
+            }
+        }
+        Some(())
+    };
+    let client_write_worker = async move {
+        loop {
+            if let Some(delta) = from_master.recv().await.ok() {
+                // dbg!("client worker: writing to client {}", from_utf8(&delta));
+                client_write.write_all(&delta).await.ok()?;
+                client_write.flush().await.ok()?;
+            } else {
+                break;
+            }
+        }
+        Some(())
+    };
+    client_write_worker.or(client_read_worker).await?;
+    Some(())
+}
+
 pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
     let winsize = Winsize {
         ws_row: 24,
@@ -156,84 +201,38 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
         .to_path_buf();
     match unsafe { forkpty(&winsize, None).unwrap() } {
         ForkptyResult::Parent { child, master } => {
-            let rt = Builder::new_current_thread().enable_all().build().unwrap();
-            rt.block_on(async {
-                let (new_client_sender, mut new_client_receiver) = unbounded_channel();
-                let (from_client_sender, mut from_client_receiver) =
-                    channel::<Message>(CHANNEL_SIZE);
-                listener.set_nonblocking(true).unwrap();
-                let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            block_on(async {
+                let (new_client_sender, new_client_receiver) = unbounded();
+                let (from_client_sender, from_client_receiver) = bounded::<Message>(CHANNEL_SIZE);
+                let listener = UnixListener::try_from(listener).unwrap();
 
                 let to_master_sender = from_client_sender.clone();
-                let _listener_worker = spawn(async move {
+                let listener_worker = async move {
                     while let Ok((client, _addr)) = listener.accept().await {
-                        let (from_master_sender, mut from_master_receiver) =
-                            channel::<Vec<u8>>(CHANNEL_SIZE);
+                        let (from_master_sender, from_master_receiver) =
+                            bounded::<Vec<u8>>(CHANNEL_SIZE);
                         // dbg!("sending channels to master");
-                        new_client_sender.send(from_master_sender).ok()?;
+                        new_client_sender.send(from_master_sender).await.ok()?;
                         let to_master_sender = to_master_sender.clone();
-                        let (mut client_read, mut client_write) = client.into_split();
-                        let _client_read_worker = spawn(async move {
-                            loop {
-                                let mut buffer = [0; BUFFER_SIZE];
-                                let mut length = [0; 2];
-                                if let Ok(2) = client_read.read_exact(&mut length).await {
-                                    let len = i16::from_be_bytes(length);
-                                    if len > 0 {
-                                        let len = len as usize;
-                                        client_read.read_exact(&mut buffer[..len]).await.ok()?;
-                                        let msg = &buffer[..len];
-                                        // dbg!("client worker: sending to master {}", from_utf8(&buffer));
-                                        to_master_sender
-                                            .send(Message::Raw(msg.to_owned()))
-                                            .await
-                                            .ok()?;
-                                    } else {
-                                        let mut row = [0; 2];
-                                        let mut col = [0; 2];
-                                        client_read.read_exact(&mut row).await.ok()?;
-                                        client_read.read_exact(&mut col).await.ok()?;
-                                        let row = u16::from_be_bytes(row);
-                                        let col = u16::from_be_bytes(col);
-                                        to_master_sender
-                                            .send(Message::Resize(row, col))
-                                            .await
-                                            .ok()?;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            }
-                            Some(())
-                        });
-                        let _client_write_worker = spawn(async move {
-                            loop {
-                                if let Some(delta) = from_master_receiver.recv().await {
-                                    // dbg!("client worker: writing to client {}", from_utf8(&delta));
-                                    client_write.write_all(&delta).await.ok()?;
-                                    client_write.flush().await.ok()?;
-                                } else {
-                                    break;
-                                }
-                            }
-                            Some(())
-                        });
+                        spawn(handle_new_client(
+                            client,
+                            from_master_receiver,
+                            to_master_sender,
+                        ))
+                        .detach();
                     }
                     Some(())
-                });
+                };
 
                 let mut replay = Replay::default();
-                let mut clients = vec![];
-                let mut read =
-                    unsafe { File::from_raw_fd(master.try_clone().unwrap().into_raw_fd()) };
-                let mut write = unsafe { File::from_raw_fd(master.into_raw_fd()) };
-                let mut signals = signal(SignalKind::child()).unwrap();
+                let mut read = File::from(master.try_clone().unwrap());
+                let mut write = File::from(master);
+                let mut signals = Signals::new([Signal::Child]).unwrap();
 
-                let _master_worker = spawn(async move {
-                    while let Some(msg) = from_client_receiver.recv().await {
+                let master_worker = async move {
+                    while let Some(msg) = from_client_receiver.recv().await.ok() {
                         match msg {
                             Message::Raw(bytes) => {
-                                // dbg!("master worker: writing to process {}", std::str::from_utf8(&bytes));
                                 write.write_all(&bytes).await.ok()?;
                                 write.flush().await.ok()?;
                             }
@@ -245,7 +244,6 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                                     ws_ypixel: 0,
                                 };
                                 unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
-                                // dbg!("master worker: resize to", winsize);
                                 let winsize = Winsize {
                                     ws_col: col,
                                     ..winsize
@@ -256,59 +254,73 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                         }
                     }
                     Some(())
-                });
+                };
 
-                loop {
+                let main_worker = async move {
+                    enum Event<'a> {
+                        Incoming(Sender<Vec<u8>>),
+                        Stdout(&'a [u8]),
+                        Closed,
+                    }
+
+                    let mut clients = vec![];
                     let mut buffer = [0; BUFFER_SIZE];
-                    select! {
-                        biased;
-                        Some(to_new_client_sender) =
-                            new_client_receiver.recv() => {
-                                // dbg!("master worker: new client");
-                                // dbg!("master worker: sending replay to client");
+
+                    loop {
+                        let event = async {
+                            if let Some(new_client) = new_client_receiver.recv().await.ok() {
+                                Event::Incoming(new_client)
+                            } else {
+                                Event::Closed
+                            }
+                        }
+                        .or(async {
+                            if let Ok(n) = read.read(&mut buffer).await {
+                                if n > 0 {
+                                    Event::Stdout(&buffer[..n])
+                                } else {
+                                    Event::Closed
+                                }
+                            } else {
+                                Event::Closed
+                            }
+                        })
+                        .or(async {
+                            signals.next().await;
+                            Event::Closed
+                        })
+                        .await;
+
+                        match event {
+                            Event::Incoming(to_new_client) => {
                                 for line in replay.replay() {
-                                    if !to_new_client_sender.send(line.to_owned()).await.is_ok() {
+                                    if !to_new_client.send(line.to_owned()).await.is_ok() {
                                         break;
                                     }
                                 }
-                                clients.push(to_new_client_sender);
-                                // dbg!("master worker: replay sent");
+                                clients.push(to_new_client);
                             }
-                        Ok(n) = read.read(&mut buffer) => {
-                            if n == 0 {
+                            Event::Stdout(delta) => {
+                                replay = replay.feed(delta);
+                                let mut active_clients = vec![];
+
+                                for to_client_sender in clients.into_iter() {
+                                    if to_client_sender.send(delta.to_owned()).await.is_ok() {
+                                        active_clients.push(to_client_sender);
+                                    }
+                                }
+                                clients = active_clients;
+                            }
+                            Event::Closed => {
+                                waitpid(child, None).ok()?;
                                 break;
                             }
-                            let msg = &buffer[..n];
-                            // dbg!("master worker: reading from process {}", std::str::from_utf8(msg));
-
-                            // dbg!("master worker: extending replay with delta");
-                            replay = replay.feed(msg);
-                            // dbg!("master worker: replay is at", match replay {
-                            //     Replay::Normal(_) => "normal",
-                            //     Replay::Alternate(_, _) => "alternate",
-                            // });
-                            // dbg!("master worker: keep latest replay", replay.len());
-                            // dbg!("master worker: replay usage", replay.usage());
-
-                            let mut active_clients = vec![];
-
-                            for to_client_sender in clients.into_iter() {
-                                // dbg!("master worker: sending delta to client");
-                                if to_client_sender.send(msg.to_owned()).await.is_ok() {
-                                    active_clients.push(to_client_sender);
-                                }
-                            }
-                            clients = active_clients;
                         }
-                        _ = signals.recv() => {
-                            waitpid(child, None).ok()?;
-                            // dbg!("master worker: child process exits");
-                            break;
-                        }
-                        else => break
                     }
-                }
+                    Some(())
+                };
 
+                listener_worker.or(master_worker).or(main_worker).await;
                 remove_file(bind).await.ok()?;
                 Some(())
             });
