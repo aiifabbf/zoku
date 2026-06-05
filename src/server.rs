@@ -8,9 +8,9 @@ use nix::{
     unistd::execvp,
 };
 use smol::{
-    block_on,
+    Unblock, block_on,
     channel::{Receiver, Sender, bounded, unbounded},
-    fs::{File, remove_file},
+    fs::remove_file,
     future::FutureExt,
     io::{AsyncReadExt, AsyncWriteExt, split},
     net::unix::{UnixListener, UnixStream},
@@ -225,8 +225,16 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                 };
 
                 let mut replay = Replay::default();
-                let mut read = File::from(master.try_clone().unwrap());
-                let mut write = File::from(master);
+                // smol isolates blocking read on another thread. Async read from a file is effectively the same as recv-ing from a bounded channel. This bounded channel has an insanely large buffer size 8MB for TTY device files (which are not real disk files), which causes significant lag when you try to Ctrl+C during `yes`. I notice ~4s lag on macOS between pressing Ctrl+C and seeing `yes` stops.
+                // https://docs.rs/smol/latest/smol/struct.Unblock.html#method.with_capacity
+                let mut read = Unblock::with_capacity(
+                    CHANNEL_SIZE,
+                    std::fs::File::from(master.try_clone().unwrap()),
+                );
+                let mut write = Unblock::with_capacity(
+                    CHANNEL_SIZE,
+                    std::fs::File::from(master.try_clone().unwrap()),
+                );
                 let mut signals = Signals::new([Signal::Child]).unwrap();
 
                 let master_worker = async move {
@@ -243,12 +251,12 @@ pub fn main(listener: std::os::unix::net::UnixListener, argv: &[CString]) {
                                     ws_xpixel: 0,
                                     ws_ypixel: 0,
                                 };
-                                unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
+                                unsafe { ioctl(master.as_raw_fd(), TIOCSWINSZ, &winsize) };
                                 let winsize = Winsize {
                                     ws_col: col,
                                     ..winsize
                                 };
-                                unsafe { ioctl(write.as_raw_fd(), TIOCSWINSZ, &winsize) };
+                                unsafe { ioctl(master.as_raw_fd(), TIOCSWINSZ, &winsize) };
                                 // Why do it twice? To force redraw. Some TUI app such as vim does not redraw whole screen if new size is the same as old size.
                             }
                         }
