@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd};
-use std::process::exit;
 
 use async_signal::{Signal, Signals};
 use nix::libc::TIOCGWINSZ;
@@ -102,5 +101,4 @@ pub fn main(master: std::os::unix::net::UnixStream) {
 
     // dbg!("reset tty");
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSAFLUSH, &old_tty).unwrap();
-    exit(0);
 }
