@@ -35,31 +35,57 @@ pub fn main(master: std::os::unix::net::UnixStream) {
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSAFLUSH, &tty).unwrap();
 
     block_on(async {
-        let mut master = UnixStream::try_from(master).unwrap();
-        let (mut master_read, mut master_write) = split(master.clone());
+        let master = UnixStream::try_from(master).unwrap();
+        let (mut master_read, mut master_write) = split(master);
         notify_resize(&mut master_write).await?;
         let mut signals = Signals::new([Signal::Winch]).unwrap();
         let mut stdin = Unblock::new(std::io::stdin());
         let mut stdout = Unblock::new(std::io::stdout());
 
         let screen_to_remote = async move {
+            enum Event<'a> {
+                Stdin(&'a [u8]),
+                Resize,
+                Detach,
+            }
             let mut buffer = [0; BUFFER_SIZE];
 
             loop {
-                if let Ok(n) = stdin.read(&mut buffer).await {
-                    if n > 0 {
-                        let msg = &buffer[..n];
+                let event = async {
+                    if let Ok(n) = stdin.read(&mut buffer).await {
+                        if n > 0 {
+                            Event::Stdin(&buffer[..n])
+                        } else {
+                            Event::Detach
+                        }
+                    } else {
+                        Event::Detach
+                    }
+                }
+                .or(async {
+                    if let Some(_) = signals.next().await {
+                        Event::Resize
+                    } else {
+                        Event::Detach
+                    }
+                })
+                .await;
+
+                match event {
+                    Event::Stdin(msg) => {
                         master_write
                             .write_all(&(msg.len() as i16).to_be_bytes())
                             .await
                             .ok()?;
                         master_write.write_all(msg).await.ok()?;
                         master_write.flush().await.ok()?;
-                    } else {
+                    }
+                    Event::Resize => {
+                        notify_resize(&mut master_write).await?;
+                    }
+                    Event::Detach => {
                         break;
                     }
-                } else {
-                    break;
                 }
             }
             Some(())
@@ -84,18 +110,7 @@ pub fn main(master: std::os::unix::net::UnixStream) {
             Some(())
         };
 
-        let resize = async move {
-            loop {
-                if let Some(_) = signals.next().await {
-                    notify_resize(&mut master).await?;
-                } else {
-                    break;
-                }
-            }
-            Some(())
-        };
-
-        screen_to_remote.or(resize).or(remote_to_screen).await?;
+        screen_to_remote.or(remote_to_screen).await?;
         Some(())
     });
 
