@@ -1,14 +1,15 @@
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd};
-use std::process::exit;
 
+use async_signal::{Signal, Signals};
 use nix::libc::TIOCGWINSZ;
 use nix::pty::Winsize;
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::runtime::Builder;
-use tokio::select;
-use tokio::signal::unix::{SignalKind, signal};
+use smol::future::FutureExt;
+use smol::io::{AsyncReadExt, AsyncWriteExt, split};
+use smol::net::unix::UnixStream;
+use smol::stream::StreamExt;
+use smol::{Unblock, block_on};
 
 const BUFFER_SIZE: usize = 4096; // bytes
 
@@ -33,51 +34,86 @@ pub fn main(master: std::os::unix::net::UnixStream) {
     std::io::stdout().flush().unwrap();
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSAFLUSH, &tty).unwrap();
 
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(async {
-        master.set_nonblocking(true).unwrap();
-        let mut master = tokio::net::UnixStream::from_std(master).unwrap();
-        notify_resize(&mut master).await?;
-        let mut signals = signal(SignalKind::window_change()).unwrap();
-        let mut stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
+    block_on(async {
+        let master = UnixStream::try_from(master).unwrap();
+        let (mut master_read, mut master_write) = split(master);
+        notify_resize(&mut master_write).await?;
+        let mut signals = Signals::new([Signal::Winch]).unwrap();
+        let mut stdin = Unblock::new(std::io::stdin());
+        let mut stdout = Unblock::new(std::io::stdout());
 
-        loop {
-            let mut master_buffer = [0; BUFFER_SIZE];
-            let mut stdin_buffer = [0; BUFFER_SIZE];
+        let screen_to_remote = async move {
+            enum Event<'a> {
+                Stdin(&'a [u8]),
+                Resize,
+                Detach,
+            }
+            let mut buffer = [0; BUFFER_SIZE];
 
-            select! {
-                biased;
-                Ok(n) = stdin.read(&mut stdin_buffer) => {
-                    let msg = &stdin_buffer[..n];
-                    if n > 0 {
-                        master.write_all(&(msg.len() as i16).to_be_bytes()).await.ok()?;
-                        master.write_all(msg).await.ok()?;
-                        master.flush().await.ok()?;
+            loop {
+                let event = async {
+                    if let Ok(n) = stdin.read(&mut buffer).await {
+                        if n > 0 {
+                            Event::Stdin(&buffer[..n])
+                        } else {
+                            Event::Detach
+                        }
                     } else {
-                        // dbg!("master is closed");
-                        break;
+                        Event::Detach
                     }
                 }
-                Some(()) = signals.recv() => {
-                    notify_resize(&mut master).await?;
-                }
-                Ok(n) = master.read(&mut master_buffer) => {
-                    let msg = &master_buffer[..n];
-                    if n > 0 {
-                        stdout.write_all(msg).await.ok()?;
-                        stdout.flush().await.ok()?;
+                .or(async {
+                    if let Some(_) = signals.next().await {
+                        Event::Resize
                     } else {
-                        // dbg!("remote is closed");
+                        Event::Detach
+                    }
+                })
+                .await;
+
+                match event {
+                    Event::Stdin(msg) => {
+                        master_write
+                            .write_all(&(msg.len() as i16).to_be_bytes())
+                            .await
+                            .ok()?;
+                        master_write.write_all(msg).await.ok()?;
+                        master_write.flush().await.ok()?;
+                    }
+                    Event::Resize => {
+                        notify_resize(&mut master_write).await?;
+                    }
+                    Event::Detach => {
                         break;
                     }
                 }
             }
-        }
+            Some(())
+        };
+
+        let remote_to_screen = async move {
+            let mut buffer = [0; BUFFER_SIZE];
+
+            loop {
+                if let Ok(n) = master_read.read(&mut buffer).await {
+                    if n > 0 {
+                        let msg = &buffer[..n];
+                        stdout.write_all(msg).await.ok()?;
+                        stdout.flush().await.ok()?;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Some(())
+        };
+
+        screen_to_remote.or(remote_to_screen).await?;
         Some(())
     });
 
     // dbg!("reset tty");
     tcsetattr(std::io::stdin().as_fd(), SetArg::TCSAFLUSH, &old_tty).unwrap();
-    exit(0);
 }
